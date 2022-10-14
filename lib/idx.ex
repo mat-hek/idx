@@ -95,6 +95,47 @@ defmodule Idx do
     end
   end
 
+  def pop!(%Idx{indices: indices} = idx, key) do
+    {value, idx} = Map.pop!(idx, {Primary, key})
+
+    idx =
+      Enum.reduce(indices, idx, fn {name, fun}, idx ->
+        name = {__MODULE__, name}
+        %{^name => data} = idx
+        key = fun.(value)
+        data = Map.delete(data, key)
+        %{idx | name => data}
+      end)
+
+    {value, idx}
+  end
+
+  def pop!(idx, name, key) do
+    name = {__MODULE__, name}
+    %{^name => %{^key => primary}} = idx
+    pop!(idx, primary)
+  end
+
+  def update!(idx, key, fun) do
+    {value, idx} = pop!(idx, key)
+    put(idx, fun.(value))
+  end
+
+  def update!(idx, name, key, fun) do
+    {value, idx} = pop!(idx, name, key)
+    put(idx, fun.(value))
+  end
+
+  def fast_update!(idx, key, fun) do
+    Map.update!(idx, {Primary, key}, fun)
+  end
+
+  def fast_update!(idx, name, key, fun) do
+    name = {__MODULE__, name}
+    %{^name => %{^key => primary}} = idx
+    fast_update!(idx, primary, fun)
+  end
+
   def size(%Idx{indices: indices} = idx) do
     map_size(idx) - map_size(Idx.__struct__()) - map_size(indices)
   end
