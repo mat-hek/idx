@@ -1,12 +1,18 @@
 defmodule Idx do
-  alias __MODULE__.Primary
+  alias __MODULE__.{Key, Primary}
+
+  @behaviour Access
 
   @enforce_keys [Primary, :indices]
   defstruct @enforce_keys
 
-  def new(enum \\ [], primary) do
-    map = Map.new(enum, &{{Primary, primary.(&1)}, &1})
-    %__MODULE__{Primary => primary, indices: %{}} |> Map.merge(map)
+  def new(enum \\ [], primary_index) do
+    map = Map.new(enum, &{{Primary, primary_index.(&1)}, &1})
+    %__MODULE__{Primary => primary_index, indices: %{}} |> Map.merge(map)
+  end
+
+  def key(index_name, key) do
+    {Key, index_name, key}
   end
 
   def create_index(%__MODULE__{indices: indices} = idx, name, fun) do
@@ -30,13 +36,14 @@ defmodule Idx do
     %{idx | indices: Map.delete(indices, name)}
   end
 
-  def put(%__MODULE__{Primary => primary, indices: indices} = idx, value) when indices == %{} do
-    Map.put(idx, {Primary, primary.(value)}, value)
+  def put(%__MODULE__{Primary => primary_index, indices: indices} = idx, value)
+      when indices == %{} do
+    Map.put(idx, {Primary, primary_index.(value)}, value)
   end
 
-  def put(%__MODULE__{Primary => primary, indices: indices} = idx, value) do
-    primary_key = primary.(value)
-    idx = Map.put(idx, {Primary, primary.(value)}, value)
+  def put(%__MODULE__{Primary => primary_index, indices: indices} = idx, value) do
+    primary_key = primary_index.(value)
+    idx = Map.put(idx, {Primary, primary_index.(value)}, value)
 
     Enum.reduce(indices, idx, fn {name, fun}, idx ->
       name = {__MODULE__, name}
@@ -46,7 +53,7 @@ defmodule Idx do
   end
 
   def fetch(%__MODULE__{} = idx, key) do
-    key = {Primary, key}
+    key = resolve_key(idx, key)
 
     case idx do
       %{^key => value} -> {:ok, value}
@@ -54,86 +61,73 @@ defmodule Idx do
     end
   end
 
-  def fetch(%{__struct__: __MODULE__} = idx, name, key) do
-    name = {__MODULE__, name}
-
-    case idx do
-      %{^name => %{^key => primary_key}} ->
-        primary_key = {Primary, primary_key}
-        %{^primary_key => value} = idx
-        {:ok, value}
-
-      %{^name => %{}} ->
-        :error
-
-      %{} ->
-        raise ArgumentError, "Unknown index #{inspect(name)}"
-    end
-  end
-
   def fetch!(idx, key) do
-    {:ok, value} = fetch(idx, key)
+    key = resolve_key!(idx, key)
+    %{^key => value} = idx
     value
   end
 
-  def fetch!(idx, name, key) do
-    {:ok, value} = fetch(idx, name, key)
-    value
-  end
-
-  def get(idx, key) do
+  def get(idx, key, default \\ nil) do
     case fetch(idx, key) do
       {:ok, value} -> value
-      :error -> nil
+      :error -> default
     end
   end
 
-  def get(idx, name, key) do
-    case fetch(idx, name, key) do
-      {:ok, value} -> value
-      :error -> nil
+  def pop!(idx, key) do
+    key = resolve_key!(idx, key)
+    {value, idx} = Map.pop!(idx, key)
+    {value, remove_value_from_indices(idx, value)}
+  end
+
+  def pop(idx, key, default \\ nil) do
+    key = resolve_key(idx, key)
+
+    case :maps.take(key, idx) do
+      {value, idx} -> {value, remove_value_from_indices(idx, value)}
+      :error -> {default, idx}
     end
   end
 
-  def pop!(%Idx{indices: indices} = idx, key) do
-    {value, idx} = Map.pop!(idx, {Primary, key})
-
-    idx =
-      Enum.reduce(indices, idx, fn {name, fun}, idx ->
-        name = {__MODULE__, name}
-        %{^name => data} = idx
-        key = fun.(value)
-        data = Map.delete(data, key)
-        %{idx | name => data}
-      end)
-
-    {value, idx}
-  end
-
-  def pop!(idx, name, key) do
-    name = {__MODULE__, name}
-    %{^name => %{^key => primary}} = idx
-    pop!(idx, primary)
+  defp remove_value_from_indices(%Idx{indices: indices} = idx, value) do
+    Enum.reduce(indices, idx, fn {name, fun}, idx ->
+      name = {__MODULE__, name}
+      %{^name => data} = idx
+      key = fun.(value)
+      data = Map.delete(data, key)
+      %{idx | name => data}
+    end)
   end
 
   def update!(idx, key, fun) do
+    key = resolve_key!(idx, key)
     {value, idx} = pop!(idx, key)
     put(idx, fun.(value))
   end
 
-  def update!(idx, name, key, fun) do
-    {value, idx} = pop!(idx, name, key)
-    put(idx, fun.(value))
+  def get_and_update!(idx, key, fun) do
+    key = resolve_key!(idx, key)
+    value = fetch!(idx, key)
+
+    case fun.(value) do
+      {get, update} -> {get, put(idx, update)}
+      :pop -> pop!(idx, key)
+    end
+  end
+
+  def get_and_update(idx, key, fun) do
+    key = resolve_key(idx, key)
+    {value, idx} = pop(idx, key)
+
+    case fun.(value) do
+      {get, update} -> {get, put(idx, update)}
+      :pop -> {value, idx}
+    end
   end
 
   def fast_update!(idx, key, fun) do
-    Map.update!(idx, {Primary, key}, fun)
-  end
-
-  def fast_update!(idx, name, key, fun) do
-    name = {__MODULE__, name}
-    %{^name => %{^key => primary}} = idx
-    fast_update!(idx, primary, fun)
+    key = resolve_key!(idx, key)
+    Map.update!(idx, key, fun)
   end
 
   def size(%Idx{indices: indices} = idx) do
@@ -161,6 +155,55 @@ defmodule Idx do
 
   def member?(%Idx{Idx.Primary => primary} = idx, value) do
     {:ok, value} == Idx.fetch(idx, primary.(value))
+  end
+
+  def primary_key!(%{__struct__: Idx} = idx, name, key) do
+    name = {__MODULE__, name}
+    %{^name => %{^key => primary}} = idx
+    primary
+  end
+
+  def primary_key(%Idx{} = idx, name, key) do
+    name = {__MODULE__, name}
+
+    case idx do
+      %{^name => %{^key => primary}} -> {:ok, primary}
+      %{} -> :error
+    end
+  end
+
+  defp resolve_key(_idx, {Primary, primary}) do
+    {Primary, primary}
+  end
+
+  defp resolve_key(idx, {Key, name, key}) do
+    name = {__MODULE__, name}
+
+    case idx do
+      %{^name => %{^key => primary}} -> {Primary, primary}
+      %{} -> Key.Imaginary
+    end
+  end
+
+  defp resolve_key(_idx, primary) do
+    {Primary, primary}
+  end
+
+  defp resolve_key!(_idx, {Primary, primary}) do
+    {Primary, primary}
+  end
+
+  defp resolve_key!(idx, {Key, name, key}) do
+    name = {__MODULE__, name}
+
+    case idx do
+      %{^name => %{^key => primary}} -> {Primary, primary}
+      %{} -> raise "Unknown key #{inspect(key)} of index #{inspect(name)}"
+    end
+  end
+
+  defp resolve_key!(_idx, primary) do
+    {Primary, primary}
   end
 end
 
