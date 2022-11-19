@@ -1,4 +1,15 @@
 defmodule Idx do
+  @moduledoc """
+  Collection allowing access via dynamically created indices
+
+      iex> users = [%{name: "Bob", age: 20}, %{name: "Eve", age: 27}, %{name: "John", age: 45}]
+      iex> idx = Idx.new(users, & &1.name)
+      iex> Idx.get(idx, "Bob")
+      %{name: "Bob", age: 20}
+      iex> idx |> Enum.to_list() |> Enum.sort()
+      users
+
+  """
   alias __MODULE__.{Key, Primary}
 
   @behaviour Access
@@ -6,15 +17,47 @@ defmodule Idx do
   @enforce_keys [Primary, :indices]
   defstruct @enforce_keys
 
+  @type t :: %{:__struct__ => __MODULE__, any => any}
+
+  @type index_name :: atom
+
+  @type key :: any
+  @type value :: any
+
+  @type full_key :: primary_key | non_primary_key
+  @type primary_key :: any
+  @opaque non_primary_key :: {Key, index_name, key :: any}
+
+  @doc """
+  Creates a new Idx instance.
+  """
+  @spec new(Enumerable.t(), (value -> key)) :: t
   def new(enum \\ [], primary_index) do
     map = Map.new(enum, &{{Primary, primary_index.(&1)}, &1})
     %__MODULE__{Primary => primary_index, indices: %{}} |> Map.merge(map)
   end
 
+  @doc """
+  Allows accessing a value by a non-primary key in the idx.
+
+  See `create_index/3` for details.
+  """
+  @spec key(index_name, non_primary_key) :: full_key
   def key(index_name, key) do
     {Key, index_name, key}
   end
 
+  @doc """
+  Creates a new non-primary index on the `Idx` instance.
+
+      iex> users = [%{name: "Bob", age: 20}, %{name: "Eve", age: 27}, %{name: "John", age: 45}]
+      iex> idx = Idx.new(users, & &1.name)
+      iex> idx = Idx.create_index(idx, :initial, &String.first(&1.name))
+      iex> Idx.get(idx, Idx.key(:initial, "J"))
+      %{name: "John", age: 45}
+
+  """
+  @spec create_index(t, index_name, (value -> key)) :: t
   def create_index(%__MODULE__{indices: indices} = idx, name, fun) do
     if Map.has_key?(indices, name) do
       raise ArgumentError, "Index #{inspect(name)} already present"
@@ -26,6 +69,7 @@ defmodule Idx do
     |> Map.put({__MODULE__, name}, data)
   end
 
+  @spec drop_index(t, index_name) :: t
   def drop_index(%__MODULE__{indices: indices} = idx, name) do
     {data, idx} = Map.pop(idx, {__MODULE__, name})
 
@@ -36,6 +80,7 @@ defmodule Idx do
     %{idx | indices: Map.delete(indices, name)}
   end
 
+  @spec put(t, value) :: t
   def put(%__MODULE__{Primary => primary_index, indices: indices} = idx, value)
       when indices == %{} do
     Map.put(idx, {Primary, primary_index.(value)}, value)
@@ -52,6 +97,7 @@ defmodule Idx do
     end)
   end
 
+  @spec fetch(t, full_key) :: {:ok, value} | :error
   def fetch(%__MODULE__{} = idx, key) do
     key = resolve_key(idx, key)
 
@@ -61,12 +107,14 @@ defmodule Idx do
     end
   end
 
+  @spec fetch!(t, full_key) :: value
   def fetch!(idx, key) do
     key = resolve_key!(idx, key)
     %{^key => value} = idx
     value
   end
 
+  @spec get(t, full_key, value | nil) :: value | nil
   def get(idx, key, default \\ nil) do
     case fetch(idx, key) do
       {:ok, value} -> value
@@ -74,6 +122,7 @@ defmodule Idx do
     end
   end
 
+  @spec pop!(t, full_key) :: value
   def pop!(idx, key) do
     key = resolve_key!(idx, key)
     {value, idx} = Map.pop!(idx, key)
@@ -99,22 +148,41 @@ defmodule Idx do
     end)
   end
 
+  @spec update!(t, full_key, (value -> value)) :: t
   def update!(idx, key, fun) do
     key = resolve_key!(idx, key)
     {value, idx} = pop!(idx, key)
     put(idx, fun.(value))
   end
 
+  @doc """
+  Updates the value under the key by calling `fun`. No indices can change after the update.
+
+  Thanks to the guarantee that the indices (including the primary index)
+  won't change, this function is faster than `update!/3`. However, if the
+  indices change, it will leave the `idx` in an invalid state and lead
+  to undefined behaviour.
+  """
+  @spec fast_update!(t, full_key, (value -> value)) :: t
+  def fast_update!(idx, key, fun) do
+    key = resolve_key!(idx, key)
+    Map.update!(idx, key, fun)
+  end
+
+  @spec get_and_update!(t, full_key, (value -> {get, update} | :pop)) :: {get, t}
+        when get: any, update: value
   def get_and_update!(idx, key, fun) do
     key = resolve_key!(idx, key)
-    value = fetch!(idx, key)
+    {value, idx} = pop!(idx, key)
 
     case fun.(value) do
       {get, update} -> {get, put(idx, update)}
-      :pop -> pop!(idx, key)
+      :pop -> {value, idx}
     end
   end
 
+  @spec get_and_update(t, full_key, (value | nil -> {get, update} | :pop)) :: {get, t}
+        when get: any, update: value
   def get_and_update(idx, key, fun) do
     key = resolve_key(idx, key)
     {value, idx} = pop(idx, key)
@@ -125,15 +193,12 @@ defmodule Idx do
     end
   end
 
-  def fast_update!(idx, key, fun) do
-    key = resolve_key!(idx, key)
-    Map.update!(idx, key, fun)
-  end
-
+  @spec size(t) :: non_neg_integer
   def size(%Idx{indices: indices} = idx) do
     map_size(idx) - map_size(Idx.__struct__()) - map_size(indices)
   end
 
+  @spec to_list(t) :: [value()]
   def to_list(%Idx{} = idx) do
     :maps.fold(
       fn
@@ -146,6 +211,11 @@ defmodule Idx do
     |> :lists.reverse()
   end
 
+  @doc """
+  Converts `idx` to a map, where keys are the primary keys
+  of the `idx.
+  """
+  @spec to_map(t) :: %{key => value}
   def to_map(%Idx{} = idx) do
     Enum.reduce(Map.from_struct(idx), %{}, fn
       {{Primary, key}, value}, acc -> Map.put(acc, key, value)
@@ -153,16 +223,22 @@ defmodule Idx do
     end)
   end
 
+  @spec member?(t, value) :: boolean
   def member?(%Idx{Idx.Primary => primary} = idx, value) do
     {:ok, value} == Idx.fetch(idx, primary.(value))
   end
 
+  @spec primary_key!(t, index_name, non_primary_key) :: primary_key
   def primary_key!(%{__struct__: Idx} = idx, name, key) do
     name = {__MODULE__, name}
     %{^name => %{^key => primary}} = idx
     primary
   end
 
+  @doc """
+  Returns the primary key of a value under the given non-primary key.
+  """
+  @spec primary_key(t, index_name, non_primary_key) :: {:ok, primary_key} | :error
   def primary_key(%Idx{} = idx, name, key) do
     name = {__MODULE__, name}
 
