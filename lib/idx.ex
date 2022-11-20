@@ -1,6 +1,9 @@
 defmodule Idx do
   @moduledoc """
-  Collection allowing access via dynamically created indices
+  Collection allowing access via dynamically created indices.
+
+  The API is similar to `Map`. See `create_index/3` for more details
+  about indices.
 
       iex> users = [%{name: "Bob", age: 20}, %{name: "Eve", age: 27}, %{name: "John", age: 45}]
       iex> idx = Idx.new(users, & &1.name)
@@ -19,19 +22,24 @@ defmodule Idx do
 
   @type t :: %{:__struct__ => __MODULE__, any => any}
 
+  @typedoc """
+  Index function. Returns a key based on the value to be indexed.
+  Must be pure (always return the same key for the same value).
+  """
+  @type index :: (value -> key)
   @type index_name :: atom
 
   @type key :: any
   @type value :: any
 
   @type full_key :: primary_key | non_primary_key
-  @type primary_key :: any
-  @opaque non_primary_key :: {Key, index_name, key :: any}
+  @type primary_key :: key
+  @opaque non_primary_key :: {Key, index_name, key}
 
   @doc """
   Creates a new Idx instance.
   """
-  @spec new(Enumerable.t(), (value -> key)) :: t
+  @spec new(Enumerable.t(), index) :: t
   def new(enum \\ [], primary_index) do
     map = Map.new(enum, &{{Primary, primary_index.(&1)}, &1})
     %__MODULE__{Primary => primary_index, indices: %{}} |> Map.merge(map)
@@ -57,7 +65,7 @@ defmodule Idx do
       %{name: "John", age: 45}
 
   """
-  @spec create_index(t, index_name, (value -> key)) :: t
+  @spec create_index(t, index_name, index) :: t
   def create_index(%__MODULE__{indices: indices} = idx, name, fun) do
     if Map.has_key?(indices, name) do
       raise ArgumentError, "Index #{inspect(name)} already present"
@@ -212,8 +220,7 @@ defmodule Idx do
   end
 
   @doc """
-  Converts `idx` to a map, where keys are the primary keys
-  of the `idx.
+  Converts `idx` to a map, where keys are the primary keys of the `idx.
   """
   @spec to_map(t) :: %{key => value}
   def to_map(%Idx{} = idx) do
