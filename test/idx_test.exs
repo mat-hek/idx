@@ -17,6 +17,13 @@ defmodule IdxTest do
     assert :error == Idx.fetch(idx, Idx.key(:user_name, "Bob"))
   end
 
+  test "lazy access" do
+    idx = Idx.new(@data, & &1) |> Idx.create_index(:user_name, & &1.name, lazy?: true)
+    test_access(idx, &Idx.key(:user_name, &1))
+    idx = Idx.drop_index(idx, :user_name)
+    assert :error == Idx.fetch(idx, Idx.key(:user_name, "Bob"))
+  end
+
   defp test_access(idx, key_gen) do
     assert %{name: "Bob", age: 20} == Idx.fetch!(idx, key_gen.("Bob"))
 

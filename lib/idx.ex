@@ -17,7 +17,7 @@ defmodule Idx do
 
   @behaviour Access
 
-  @enforce_keys [Primary, :indices]
+  @enforce_keys [Primary, :indices, :lazy_indices]
   defstruct @enforce_keys
 
   @type t :: %{:__struct__ => __MODULE__, any => any}
@@ -42,7 +42,7 @@ defmodule Idx do
   @spec new(Enumerable.t(), index) :: t
   def new(enum \\ [], primary_index) do
     map = Map.new(enum, &{{Primary, primary_index.(&1)}, &1})
-    %__MODULE__{Primary => primary_index, indices: %{}} |> Map.merge(map)
+    %__MODULE__{Primary => primary_index, indices: %{}, lazy_indices: %{}} |> Map.merge(map)
   end
 
   @doc """
@@ -64,28 +64,40 @@ defmodule Idx do
       iex> Idx.get(idx, Idx.key(:initial, "J"))
       %{name: "John", age: 45}
 
+  If `lazy` option is set to true, the index keys won't be precomputed and stored,
+  instead it will always be calculated on demand. This will slow down access, but
+  speed up insertion and operations relying on other indices.
   """
-  @spec create_index(t, index_name, index) :: t
-  def create_index(%__MODULE__{indices: indices} = idx, name, fun) do
-    if Map.has_key?(indices, name) do
+  @spec create_index(t, index_name, index, lazy?: boolean()) :: t
+  def create_index(%__MODULE__{} = idx, name, fun, options \\ []) do
+    %__MODULE__{indices: indices, lazy_indices: lazy_indices} = idx
+
+    if Map.has_key?(indices, name) or Map.has_key?(lazy_indices, name) do
       raise ArgumentError, "Index #{inspect(name)} already present"
     end
 
-    data = idx |> to_map() |> Map.new(fn {key, value} -> {fun.(value), key} end)
+    if Keyword.get(options, :lazy?, false) do
+      %{idx | lazy_indices: Map.put(lazy_indices, name, fun)}
+    else
+      data = idx |> to_map() |> Map.new(fn {key, value} -> {fun.(value), key} end)
 
-    %{idx | indices: Map.put(indices, name, fun)}
-    |> Map.put({__MODULE__, name}, data)
+      %{idx | indices: Map.put(indices, name, fun)}
+      |> Map.put({__MODULE__, name}, data)
+    end
   end
 
   @spec drop_index(t, index_name) :: t
-  def drop_index(%__MODULE__{indices: indices} = idx, name) do
-    {data, idx} = Map.pop(idx, {__MODULE__, name})
+  def drop_index(%__MODULE__{} = idx, name) do
+    %__MODULE__{indices: indices, lazy_indices: lazy_indices} = idx
+    {eager_fun, indices} = Map.pop(indices, name)
+    {lazy_fun, lazy_indices} = Map.pop(lazy_indices, name)
 
-    unless data do
+    unless eager_fun || lazy_fun do
       raise ArgumentError, "Unknown index #{inspect(name)}"
     end
 
-    %{idx | indices: Map.delete(indices, name)}
+    idx = Map.delete(idx, {__MODULE__, name})
+    %{idx | indices: indices, lazy_indices: lazy_indices}
   end
 
   @spec put(t, value) :: t
@@ -220,7 +232,7 @@ defmodule Idx do
   end
 
   @doc """
-  Converts `idx` to a map, where keys are the primary keys of the `idx.
+  Converts `idx` to a map, where keys are the primary keys of the `idx`.
   """
   @spec to_map(t) :: %{key => value}
   def to_map(%Idx{} = idx) do
@@ -260,10 +272,11 @@ defmodule Idx do
   end
 
   defp resolve_key(idx, {Key, name, key}) do
-    name = {__MODULE__, name}
+    data_ref = {__MODULE__, name}
 
     case idx do
-      %{^name => %{^key => primary}} -> {Primary, primary}
+      %{^data_ref => %{^key => primary}} -> {Primary, primary}
+      %{lazy_indices: %{^name => fun}} -> resolve_key_lazy(idx, fun, key)
       %{} -> Key.Imaginary
     end
   end
@@ -277,16 +290,21 @@ defmodule Idx do
   end
 
   defp resolve_key!(idx, {Key, name, key}) do
-    name = {__MODULE__, name}
-
-    case idx do
-      %{^name => %{^key => primary}} -> {Primary, primary}
-      %{} -> raise "Unknown key #{inspect(key)} of index #{inspect(name)}"
+    case resolve_key(idx, {Key, name, key}) do
+      Key.Imaginary -> raise "Unknown key #{inspect(key)} of index #{inspect(name)}"
+      primary_key -> primary_key
     end
   end
 
   defp resolve_key!(_idx, primary) do
     {Primary, primary}
+  end
+
+  defp resolve_key_lazy(idx, fun, key) do
+    Enum.find_value(Map.from_struct(idx), Key.Imaginary, fn
+      {{Primary, primary_key}, value} -> if fun.(value) === key, do: {Primary, primary_key}
+      _entry -> nil
+    end)
   end
 end
 
@@ -332,7 +350,10 @@ defimpl Inspect, for: Idx do
       to_doc(Idx.to_list(idx), opts),
       ", ",
       "indices: ",
-      to_doc([primary: primary] ++ Enum.to_list(idx.indices), opts),
+      to_doc(
+        [primary: primary] ++ Enum.to_list(idx.indices) ++ Enum.to_list(idx.lazy_indices),
+        opts
+      ),
       ">"
     ])
   end
